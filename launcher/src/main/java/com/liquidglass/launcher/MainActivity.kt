@@ -14,10 +14,12 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 import android.text.Editable
+import android.text.TextUtils
 import android.text.TextWatcher
 import android.text.format.DateFormat
-import android.text.TextUtils
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
@@ -25,6 +27,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.Space
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -34,8 +37,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.PagerSnapHelper
 import androidx.recyclerview.widget.RecyclerView
 import com.example.liquidglass.GlassMaterial
 import com.example.liquidglass.LiquidGlassDialogBuilder
@@ -44,13 +47,23 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+private const val COLS = 4
 
 fun Context.dp(v: Float): Float = v * resources.displayMetrics.density
 fun Context.dpi(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
+/**
+ * iPhone (iOS 26) style home screen:
+ *  - pakkam pakkamaa swipe panra app pages (4 columns)
+ *  - first page-la Liquid Glass date/clock widget
+ *  - keela "Search" pill (swipe pannum podhu page dots)
+ *  - glass dock, labels illaadha 4 apps
+ *  - keezha swipe down panna Spotlight search
+ */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: Prefs
@@ -61,23 +74,45 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var root: FrameLayout
     private lateinit var wallpaper: ImageView
-    private lateinit var grid: RecyclerView
-    private lateinit var gridAdapter: AppAdapter
 
-    private lateinit var clockGlass: LiquidGlassView
+    // Pages
+    private lateinit var pager: RecyclerView
+    private val pagesAdapter = PagesAdapter()
+    private var pages: List<List<AppEntry>> = emptyList()
+    private var currentPage = 0
+    private var topPad = 0
+    private var bottomPad = 0
+    private var rowsPerPage = 6
+
+    // Widget
+    private lateinit var widgetGlass: LiquidGlassView
+    private lateinit var weekdayText: TextView
+    private lateinit var dayNumText: TextView
+    private lateinit var monthText: TextView
     private lateinit var timeText: TextView
-    private lateinit var dateText: TextView
+    private lateinit var ampmText: TextView
 
-    private lateinit var searchPill: LiquidGlassView
+    // Search pill + dots
+    private lateinit var pill: LiquidGlassView
+    private lateinit var pillLabel: TextView
+    private lateinit var dotsRow: LinearLayout
+    private val showLabelRunnable = Runnable { showPillLabel(true) }
+
+    // Dock
     private lateinit var dockGlass: LiquidGlassView
     private lateinit var dockRow: LinearLayout
 
+    // Spotlight search
     private lateinit var searchPanel: LiquidGlassView
     private lateinit var searchInput: EditText
-    private lateinit var searchAdapter: AppAdapter
+    private lateinit var searchAdapter: SearchAdapter
     private var searchOpen = false
 
     private val allGlass = mutableListOf<LiquidGlassView>()
+
+    // Swipe-down detection
+    private var downX = 0f
+    private var downY = 0f
 
     private val pickWallpaper =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
@@ -87,7 +122,6 @@ class MainActivity : AppCompatActivity() {
                         uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
                 } catch (e: SecurityException) {
-                    // Sila gallery apps persist permission tharaadhu; current session-la work aagum
                 }
                 prefs.wallpaperUri = uri.toString()
                 loadWallpaper()
@@ -107,6 +141,10 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = Color.TRANSPARENT
         window.navigationBarColor = Color.TRANSPARENT
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+        }
 
         buildUi()
         setContentView(root)
@@ -114,7 +152,7 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (searchOpen) closeSearch() else grid.smoothScrollToPosition(0)
+                if (searchOpen) closeSearch() else goToFirstPage()
             }
         })
 
@@ -142,13 +180,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        reloadApps() // pudhu app install / uninstall aana update aagum
+        reloadApps()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // Home button press pannaa: search close, top-ku scroll
-        if (searchOpen) closeSearch() else grid.smoothScrollToPosition(0)
+        if (searchOpen) closeSearch() else goToFirstPage()
     }
 
     override fun onDestroy() {
@@ -156,106 +193,180 @@ class MainActivity : AppCompatActivity() {
         io.shutdown()
     }
 
+    /** Home screen-la keezha swipe panna Spotlight search open aagum (iPhone maadhiri). */
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (!searchOpen) {
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = ev.rawX; downY = ev.rawY
+                }
+                MotionEvent.ACTION_UP -> {
+                    val dx = ev.rawX - downX
+                    val dy = ev.rawY - downY
+                    if (dy > dp(90f) && abs(dy) > 2 * abs(dx)) {
+                        openSearch()
+                    }
+                }
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+
     // ==================== UI ====================
 
     private fun buildUi() {
         root = FrameLayout(this).apply { clipChildren = false }
 
-        // 1) Wallpaper
         wallpaper = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
         root.addView(wallpaper, FrameLayout.LayoutParams(MATCH, MATCH))
 
-        // 2) App grid (icons glass-ku keezha scroll aagum, adhanaala refraction theriyum)
-        gridAdapter = AppAdapter(
-            listMode = false,
-            onClick = ::launch,
-            onLongClick = ::showAppMenu
-        )
-        gridAdapter.showLabels = prefs.showLabels
-        grid = RecyclerView(this).apply {
-            layoutManager = GridLayoutManager(this@MainActivity, 4)
-            adapter = gridAdapter
-            clipToPadding = false
+        buildWidget()
+
+        pager = RecyclerView(this).apply {
+            layoutManager = LinearLayoutManager(this@MainActivity, LinearLayoutManager.HORIZONTAL, false)
+            adapter = pagesAdapter
             overScrollMode = View.OVER_SCROLL_NEVER
-            isVerticalScrollBarEnabled = false
-        }
-        root.addView(grid, FrameLayout.LayoutParams(MATCH, MATCH))
+            itemAnimator = null
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
+                    val w = rv.width
+                    if (w > 0) {
+                        val p = (rv.computeHorizontalScrollOffset() + w / 2) / w
+                        if (p != currentPage) {
+                            currentPage = p
+                            updateDots()
+                        }
+                    }
+                }
 
-        // 3) Clock widget
-        clockGlass = makeGlass(radiusDp = 30f).apply {
-            setOnClickListener { showSettings() }
+                override fun onScrollStateChanged(rv: RecyclerView, newState: Int) {
+                    root.removeCallbacks(showLabelRunnable)
+                    if (newState == RecyclerView.SCROLL_STATE_IDLE) {
+                        root.postDelayed(showLabelRunnable, 1200)
+                    } else {
+                        showPillLabel(false)
+                    }
+                }
+            })
         }
-        val clockRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dpi(24), 0, dpi(20), 0)
-        }
-        val clockCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        timeText = TextView(this).apply {
-            textSize = 46f
-            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
-            styleWhite(this)
-        }
-        dateText = TextView(this).apply {
-            textSize = 15f
-            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-            styleWhite(this)
-            alpha = 0.9f
-        }
-        clockCol.addView(timeText)
-        clockCol.addView(dateText)
-        clockRow.addView(clockCol, LinearLayout.LayoutParams(0, WRAP, 1f))
-        clockRow.addView(TextView(this).apply {
-            text = "•••"
-            textSize = 16f
-            styleWhite(this)
-            alpha = 0.8f
-        })
-        clockGlass.addView(clockRow, FrameLayout.LayoutParams(MATCH, MATCH))
-        root.addView(clockGlass, FrameLayout.LayoutParams(MATCH, dpi(112)).apply {
-            gravity = Gravity.TOP
-            leftMargin = dpi(16); rightMargin = dpi(16)
-        })
+        PagerSnapHelper().attachToRecyclerView(pager)
+        root.addView(pager, FrameLayout.LayoutParams(MATCH, MATCH))
 
-        // 4) Search pill
-        searchPill = makeGlass(radiusDp = 999f).apply {
+        // Search pill (iOS 26: idle-la "Search", swipe pannum podhu page dots)
+        pill = makeGlass(radiusDp = 999f).apply {
             pressScale = 1.08f
             setOnClickListener { openSearch() }
         }
-        searchPill.addView(TextView(this).apply {
-            text = "⌕  Search"
-            textSize = 15f
+        val pillContent = FrameLayout(this)
+        pillLabel = TextView(this).apply {
+            text = "⌕ Search"
+            textSize = 14f
             gravity = Gravity.CENTER
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             styleWhite(this)
-        }, FrameLayout.LayoutParams(MATCH, MATCH))
-        root.addView(searchPill, FrameLayout.LayoutParams(dpi(128), dpi(40)).apply {
+        }
+        dotsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            alpha = 0f
+        }
+        pillContent.addView(pillLabel, FrameLayout.LayoutParams(MATCH, MATCH))
+        pillContent.addView(dotsRow, FrameLayout.LayoutParams(MATCH, MATCH))
+        pill.addView(pillContent, FrameLayout.LayoutParams(MATCH, MATCH))
+        root.addView(pill, FrameLayout.LayoutParams(dpi(112), dpi(34)).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
         })
 
-        // 5) Dock
-        dockGlass = makeGlass(radiusDp = 34f).apply { enablePressEffect = false }
+        // Dock
+        dockGlass = makeGlass(radiusDp = 36f).apply { enablePressEffect = false }
         dockRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
-            setPadding(dpi(10), 0, dpi(10), 0)
+            setPadding(dpi(8), 0, dpi(8), 0)
         }
         dockGlass.addView(dockRow, FrameLayout.LayoutParams(MATCH, MATCH))
         root.addView(dockGlass, FrameLayout.LayoutParams(MATCH, dpi(92)).apply {
             gravity = Gravity.BOTTOM
-            leftMargin = dpi(12); rightMargin = dpi(12)
+            leftMargin = dpi(10); rightMargin = dpi(10)
         })
 
-        // 6) Search panel (full-screen glass)
         buildSearchPanel()
-
         applyTintToAll()
     }
 
+    /** iOS "Calendar + Clock" maadhiri wide glass widget. */
+    private fun buildWidget() {
+        widgetGlass = makeGlass(radiusDp = 26f).apply {
+            backdropSource = wallpaper   // RecyclerView-kulla irukkuradhaala wallpaper-a direct-aa sample pannum
+            setOnClickListener { showSettings() }
+        }
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dpi(20), dpi(16), dpi(20), dpi(16))
+        }
+
+        val left = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        weekdayText = TextView(this).apply {
+            textSize = 13f
+            typeface = Typeface.create("sans-serif", Typeface.BOLD)
+            setTextColor(0xFFFF453A.toInt())   // iOS calendar red
+            letterSpacing = 0.04f
+        }
+        dayNumText = TextView(this).apply {
+            textSize = 52f
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            styleWhite(this)
+            includeFontPadding = false
+        }
+        monthText = TextView(this).apply {
+            textSize = 13f
+            styleWhite(this)
+            alpha = 0.75f
+        }
+        left.addView(weekdayText)
+        left.addView(dayNumText)
+        left.addView(monthText)
+
+        val divider = View(this).apply { setBackgroundColor(0x33FFFFFF) }
+
+        val right = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+        val timeRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+        }
+        timeText = TextView(this).apply {
+            textSize = 50f
+            typeface = Typeface.create("sans-serif-thin", Typeface.NORMAL)
+            styleWhite(this)
+            includeFontPadding = false
+        }
+        ampmText = TextView(this).apply {
+            textSize = 15f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            styleWhite(this)
+            setPadding(dpi(4), 0, 0, dpi(8))
+        }
+        timeRow.addView(timeText)
+        timeRow.addView(ampmText)
+        right.addView(timeRow)
+
+        row.addView(left, LinearLayout.LayoutParams(0, WRAP, 1f))
+        row.addView(divider, LinearLayout.LayoutParams(dpi(1), MATCH).apply {
+            topMargin = dpi(8); bottomMargin = dpi(8)
+        })
+        row.addView(right, LinearLayout.LayoutParams(0, MATCH, 1.3f))
+        widgetGlass.addView(row, FrameLayout.LayoutParams(MATCH, MATCH))
+    }
+
     private fun buildSearchPanel() {
-        searchPanel = makeGlass(radiusDp = 36f).apply {
+        searchPanel = makeGlass(radiusDp = 38f).apply {
             visibility = View.GONE
             enablePressEffect = false
-            blurAmount = 0.5f            // periya panel-ku strong blur, text padikka easy
+            blurAmount = 0.5f
             material = GlassMaterial.REGULAR
         }
         val col = LinearLayout(this).apply {
@@ -267,7 +378,7 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         searchInput = EditText(this).apply {
-            hint = "Search apps"
+            hint = "⌕  Search"
             setHintTextColor(0x99FFFFFF.toInt())
             setTextColor(Color.WHITE)
             textSize = 17f
@@ -300,17 +411,22 @@ class MainActivity : AppCompatActivity() {
         })
         col.addView(bar, LinearLayout.LayoutParams(MATCH, WRAP))
 
-        searchAdapter = AppAdapter(
-            listMode = true,
-            onClick = ::launch,
-            onLongClick = ::showAppMenu
-        )
+        col.addView(TextView(this).apply {
+            text = "APPS"
+            textSize = 12f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setTextColor(0xB3FFFFFF.toInt())
+            letterSpacing = 0.06f
+            setPadding(dpi(6), dpi(16), 0, dpi(4))
+        })
+
+        searchAdapter = SearchAdapter()
         val list = RecyclerView(this).apply {
             layoutManager = LinearLayoutManager(this@MainActivity)
             adapter = searchAdapter
             overScrollMode = View.OVER_SCROLL_NEVER
         }
-        col.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f).apply { topMargin = dpi(10) })
+        col.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
         searchPanel.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
         root.addView(searchPanel, FrameLayout.LayoutParams(MATCH, MATCH).apply {
@@ -318,11 +434,10 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    /** Ella glass-um ore style-la irukka oru factory. */
     private fun makeGlass(radiusDp: Float): LiquidGlassView =
         LiquidGlassView(this).apply {
-            enableDynamicBackground = true   // scroll pannum podhu glass update aaganum
-            useShaderPipeline = true         // API 33+ la real SDF refraction
+            enableDynamicBackground = true
+            useShaderPipeline = true
             material = GlassMaterial.REGULAR
             cornerRadius = if (radiusDp >= 999f) 999f else dp(radiusDp)
             refractionHeight = 180f
@@ -331,7 +446,7 @@ class MainActivity : AppCompatActivity() {
             blurAmount = 0.05f
             saturation = 150f
             enableEdgeHighlight = true
-            enableSensorHighlight = true     // phone tilt panna highlight move aagum
+            enableSensorHighlight = true
             allGlass.add(this)
         }
 
@@ -350,13 +465,12 @@ class MainActivity : AppCompatActivity() {
                 else -> g.glassTint = Color.TRANSPARENT
             }
         }
-        // Search panel-ku konjam dark tint eppavum venum, illana text padikka kashtam
         if (prefs.tintStyle == 0 || prefs.tintStyle == 4) {
             searchPanel.setGlassTint(Color.BLACK, 0.25f)
         }
     }
 
-    // ==================== Insets ====================
+    // ==================== Insets & layout ====================
 
     private fun applyInsets() {
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
@@ -364,24 +478,82 @@ class MainActivity : AppCompatActivity() {
             val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
             val bottom = bars.bottom
 
-            (clockGlass.layoutParams as FrameLayout.LayoutParams).topMargin = bars.top + dpi(12)
             (dockGlass.layoutParams as FrameLayout.LayoutParams).bottomMargin = bottom + dpi(10)
-            (searchPill.layoutParams as FrameLayout.LayoutParams).bottomMargin =
-                bottom + dpi(10 + 92 + 12)
+            (pill.layoutParams as FrameLayout.LayoutParams).bottomMargin = bottom + dpi(10 + 92 + 14)
             (searchPanel.layoutParams as FrameLayout.LayoutParams).apply {
                 topMargin = bars.top + dpi(10)
                 bottomMargin = maxOf(bottom, ime.bottom) + dpi(10)
             }
 
-            grid.setPadding(
-                dpi(8),
-                bars.top + dpi(12 + 112 + 18),
-                dpi(8),
-                bottom + dpi(10 + 92 + 12 + 40 + 16)
-            )
+            val newTop = bars.top + dpi(14)
+            val newBottom = bottom + dpi(10 + 92 + 14 + 34 + 10)
+            if (newTop != topPad || newBottom != bottomPad) {
+                topPad = newTop
+                bottomPad = newBottom
+                root.post { rebuildPages() }
+            }
             root.requestLayout()
             WindowInsetsCompat.CONSUMED
         }
+    }
+
+    private fun cellHeight(): Int = dpi(100)
+
+    /** Screen height-ku etha maadhiri apps-a pages-aa pirikkum. */
+    private fun rebuildPages() {
+        val h = root.height
+        if (h == 0) {
+            root.post { rebuildPages() }
+            return
+        }
+        rowsPerPage = maxOf(3, (h - topPad - bottomPad) / cellHeight())
+        val perPage = rowsPerPage * COLS
+        val firstPageCap = maxOf(0, (rowsPerPage - 2) * COLS) // widget 2 rows edukkum
+
+        val gridApps = apps.filter { it.key !in dockKeys }
+        val result = mutableListOf<List<AppEntry>>()
+        result.add(gridApps.take(firstPageCap))
+        var i = firstPageCap
+        while (i < gridApps.size) {
+            result.add(gridApps.subList(i, minOf(i + perPage, gridApps.size)))
+            i += perPage
+        }
+        pages = result
+        if (currentPage >= pages.size) currentPage = pages.size - 1
+        pagesAdapter.refresh()
+        buildDots()
+    }
+
+    private fun goToFirstPage() {
+        if (::pager.isInitialized) pager.smoothScrollToPosition(0)
+    }
+
+    // ==================== Dots ====================
+
+    private fun buildDots() {
+        dotsRow.removeAllViews()
+        for (i in pages.indices) {
+            dotsRow.addView(View(this).apply {
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(Color.WHITE)
+                }
+            }, LinearLayout.LayoutParams(dpi(7), dpi(7)).apply {
+                leftMargin = dpi(4); rightMargin = dpi(4)
+            })
+        }
+        updateDots()
+    }
+
+    private fun updateDots() {
+        for (i in 0 until dotsRow.childCount) {
+            dotsRow.getChildAt(i).alpha = if (i == currentPage) 1f else 0.35f
+        }
+    }
+
+    private fun showPillLabel(show: Boolean) {
+        pillLabel.animate().alpha(if (show) 1f else 0f).setDuration(180).start()
+        dotsRow.animate().alpha(if (show) 0f else 1f).setDuration(180).start()
     }
 
     // ==================== Clock ====================
@@ -389,9 +561,17 @@ class MainActivity : AppCompatActivity() {
     private fun updateClock() {
         if (!::timeText.isInitialized) return
         val now = Date()
-        val pattern = if (DateFormat.is24HourFormat(this)) "HH:mm" else "h:mm"
-        timeText.text = SimpleDateFormat(pattern, Locale.getDefault()).format(now)
-        dateText.text = SimpleDateFormat("EEEE, d MMMM", Locale.getDefault()).format(now)
+        val loc = Locale.getDefault()
+        weekdayText.text = SimpleDateFormat("EEEE", loc).format(now).uppercase(loc)
+        dayNumText.text = SimpleDateFormat("d", loc).format(now)
+        monthText.text = SimpleDateFormat("MMMM yyyy", loc).format(now)
+        if (DateFormat.is24HourFormat(this)) {
+            timeText.text = SimpleDateFormat("HH:mm", loc).format(now)
+            ampmText.text = ""
+        } else {
+            timeText.text = SimpleDateFormat("h:mm", loc).format(now)
+            ampmText.text = SimpleDateFormat("a", loc).format(now).uppercase(loc)
+        }
     }
 
     // ==================== Apps ====================
@@ -402,19 +582,14 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
                 apps = loaded
-                val saved = prefs.dock
-                if (saved == null) prefs.dock = AppRepository.defaultDock(this, loaded)
+                if (prefs.dock == null) prefs.dock = AppRepository.defaultDock(this, loaded)
                 val installed = loaded.map { it.key }.toSet()
                 dockKeys = (prefs.dock ?: emptyList()).filter { it in installed }
                 refreshDock()
-                refreshGrid()
+                rebuildPages()
                 if (searchOpen) filterSearch(searchInput.text.toString())
             }
         }
-    }
-
-    private fun refreshGrid() {
-        gridAdapter.items = apps.filter { it.key !in dockKeys }
     }
 
     private fun refreshDock() {
@@ -423,16 +598,54 @@ class MainActivity : AppCompatActivity() {
         for (key in dockKeys) {
             val app = byKey[key] ?: continue
             val icon = ImageView(this).apply {
-                setImageDrawable(app.icon)
+                setImageDrawable(app.freshIcon())
                 contentDescription = app.label
-                setOnClickListener { launch(app) }
-                setOnLongClickListener { showAppMenu(app, it); true }
+                setOnClickListener { v -> bounce(v); launch(app) }
+                setOnLongClickListener { v -> showAppMenu(app, v); true }
             }
             val slot = FrameLayout(this)
-            slot.addView(icon, FrameLayout.LayoutParams(dpi(58), dpi(58), Gravity.CENTER))
+            slot.addView(icon, FrameLayout.LayoutParams(dpi(62), dpi(62), Gravity.CENTER))
             dockRow.addView(slot, LinearLayout.LayoutParams(0, MATCH, 1f))
         }
         dockGlass.visibility = if (dockKeys.isEmpty()) View.INVISIBLE else View.VISIBLE
+    }
+
+    /** Oru app icon + peru (iOS style). */
+    private fun makeAppCell(app: AppEntry): View {
+        val cell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dpi(8), 0, 0)
+        }
+        val icon = ImageView(this).apply {
+            setImageDrawable(app.freshIcon())
+            contentDescription = app.label
+        }
+        cell.addView(icon, LinearLayout.LayoutParams(dpi(62), dpi(62)))
+        if (prefs.showLabels) {
+            cell.addView(TextView(this).apply {
+                text = app.label
+                textSize = 11.5f
+                gravity = Gravity.CENTER
+                isSingleLine = true
+                ellipsize = TextUtils.TruncateAt.END
+                setTextColor(Color.WHITE)
+                setShadowLayer(6f, 0f, 1f, 0x99000000.toInt())
+                setPadding(dpi(2), 0, dpi(2), 0)
+            }, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dpi(5) })
+        }
+        cell.setOnClickListener { v -> bounce(icon); launch(app) }
+        cell.setOnLongClickListener { v ->
+            v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            showAppMenu(app, v); true
+        }
+        return cell
+    }
+
+    private fun bounce(v: View) {
+        v.animate().scaleX(0.88f).scaleY(0.88f).setDuration(80).withEndAction {
+            v.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+        }.start()
     }
 
     private fun launch(app: AppEntry) {
@@ -451,9 +664,9 @@ class MainActivity : AppCompatActivity() {
     private fun showAppMenu(app: AppEntry, anchor: View) {
         val inDock = app.key in dockKeys
         val items = arrayOf(
-            if (inDock) "Remove from dock" else "Add to dock",
-            "App info",
-            "Uninstall"
+            if (inDock) "Remove from Dock" else "Add to Dock",
+            "App Info",
+            "Remove App"
         )
         LiquidGlassDialogBuilder(this)
             .setTitle(app.label)
@@ -472,13 +685,13 @@ class MainActivity : AppCompatActivity() {
         if (app.key in list) {
             list.remove(app.key)
         } else {
-            if (list.size >= 4) list.removeAt(list.size - 1) // full-aa irundha last-a replace
+            if (list.size >= 4) list.removeAt(list.size - 1)
             list.add(app.key)
         }
         dockKeys = list
         prefs.dock = list
         refreshDock()
-        refreshGrid()
+        rebuildPages()
     }
 
     private fun openAppInfo(app: AppEntry) {
@@ -494,11 +707,9 @@ class MainActivity : AppCompatActivity() {
     private fun uninstall(app: AppEntry) {
         try {
             @Suppress("DEPRECATION")
-            startActivity(
-                Intent(Intent.ACTION_DELETE, Uri.parse("package:" + app.component.packageName))
-            )
+            startActivity(Intent(Intent.ACTION_DELETE, Uri.parse("package:" + app.component.packageName)))
         } catch (e: Exception) {
-            Toast.makeText(this, "Indha app-a uninstall panna mudiyadhu", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Indha app-a remove panna mudiyadhu", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -509,10 +720,9 @@ class MainActivity : AppCompatActivity() {
         searchOpen = true
         filterSearch("")
         searchPanel.alpha = 0f
-        searchPanel.scaleX = 0.94f
-        searchPanel.scaleY = 0.94f
+        searchPanel.translationY = -dp(40f)
         searchPanel.visibility = View.VISIBLE
-        searchPanel.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(220).start()
+        searchPanel.animate().alpha(1f).translationY(0f).setDuration(240).start()
         searchInput.requestFocus()
         WindowCompat.getInsetsController(window, searchInput).show(WindowInsetsCompat.Type.ime())
     }
@@ -521,7 +731,7 @@ class MainActivity : AppCompatActivity() {
         if (!searchOpen) return
         searchOpen = false
         WindowCompat.getInsetsController(window, searchInput).hide(WindowInsetsCompat.Type.ime())
-        searchPanel.animate().alpha(0f).scaleX(0.94f).scaleY(0.94f).setDuration(180)
+        searchPanel.animate().alpha(0f).translationY(-dp(40f)).setDuration(180)
             .withEndAction {
                 searchPanel.visibility = View.GONE
                 searchInput.setText("")
@@ -539,11 +749,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun showSettings() {
         val items = arrayOf(
-            "Change wallpaper",
-            "Default wallpaper",
-            "Glass colour",
-            if (prefs.showLabels) "Hide app names" else "Show app names",
-            "Set as default Home app"
+            "Change Wallpaper",
+            "Default Wallpaper",
+            "Glass Colour",
+            if (prefs.showLabels) "Hide App Names" else "Show App Names",
+            "Set as Default Home App"
         )
         LiquidGlassDialogBuilder(this)
             .setTitle("Glass Home")
@@ -554,7 +764,7 @@ class MainActivity : AppCompatActivity() {
                     2 -> showTintPicker()
                     3 -> {
                         prefs.showLabels = !prefs.showLabels
-                        gridAdapter.showLabels = prefs.showLabels
+                        pagesAdapter.refresh()
                     }
                     4 -> openHomeSettings()
                 }
@@ -563,9 +773,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showTintPicker() {
-        val names = arrayOf("Clear (iOS)", "Blue", "Pink", "Dark", "Frosted white")
+        val names = arrayOf("Clear (iOS)", "Blue", "Pink", "Dark", "Frosted White")
         LiquidGlassDialogBuilder(this)
-            .setTitle("Glass colour")
+            .setTitle("Glass Colour")
             .setSingleChoiceItems(names, prefs.tintStyle) { dialog, which ->
                 prefs.tintStyle = which
                 applyTintToAll()
@@ -621,23 +831,61 @@ class MainActivity : AppCompatActivity() {
         null
     }
 
-    // ==================== Adapter ====================
+    // ==================== Adapters ====================
 
-    /** Grid (home screen) mattum list (search) rendukkum ore adapter. */
-    private inner class AppAdapter(
-        private val listMode: Boolean,
-        private val onClick: (AppEntry) -> Unit,
-        private val onLongClick: (AppEntry, View) -> Unit
-    ) : RecyclerView.Adapter<AppAdapter.VH>() {
+    /** Ovvoru item-um oru full home screen page. */
+    private inner class PagesAdapter : RecyclerView.Adapter<PagesAdapter.PageVH>() {
 
-        var items: List<AppEntry> = emptyList()
-            @SuppressLint("NotifyDataSetChanged")
-            set(value) {
-                field = value
-                notifyDataSetChanged()
+        inner class PageVH(val page: LinearLayout) : RecyclerView.ViewHolder(page)
+
+        @SuppressLint("NotifyDataSetChanged")
+        fun refresh() = notifyDataSetChanged()
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): PageVH {
+            val page = LinearLayout(parent.context).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = RecyclerView.LayoutParams(MATCH, MATCH)
+            }
+            return PageVH(page)
+        }
+
+        override fun onBindViewHolder(holder: PageVH, position: Int) {
+            val page = holder.page
+            page.removeAllViews()
+            page.setPadding(dpi(14), topPad, dpi(14), bottomPad)
+
+            val list = pages[position]
+            var rows = rowsPerPage
+
+            if (position == 0) {
+                (widgetGlass.parent as? ViewGroup)?.removeView(widgetGlass)
+                page.addView(widgetGlass, LinearLayout.LayoutParams(MATCH, cellHeight() * 2 - dpi(16)).apply {
+                    leftMargin = dpi(6); rightMargin = dpi(6)
+                    topMargin = dpi(4); bottomMargin = dpi(12)
+                })
+                rows -= 2
+                updateClock()
             }
 
-        var showLabels: Boolean = true
+            for (r in 0 until rows) {
+                val rowView = LinearLayout(page.context).apply { orientation = LinearLayout.HORIZONTAL }
+                for (c in 0 until COLS) {
+                    val idx = r * COLS + c
+                    val lp = LinearLayout.LayoutParams(0, MATCH, 1f)
+                    if (idx < list.size) rowView.addView(makeAppCell(list[idx]), lp)
+                    else rowView.addView(Space(page.context), lp)
+                }
+                page.addView(rowView, LinearLayout.LayoutParams(MATCH, cellHeight()))
+            }
+        }
+
+        override fun getItemCount(): Int = pages.size
+    }
+
+    /** Spotlight search results list. */
+    private inner class SearchAdapter : RecyclerView.Adapter<SearchAdapter.VH>() {
+
+        var items: List<AppEntry> = emptyList()
             @SuppressLint("NotifyDataSetChanged")
             set(value) {
                 field = value
@@ -652,49 +900,27 @@ class MainActivity : AppCompatActivity() {
             val icon = ImageView(ctx)
             val label = TextView(ctx).apply {
                 setTextColor(Color.WHITE)
+                textSize = 16f
                 isSingleLine = true
                 ellipsize = TextUtils.TruncateAt.END
             }
-            val container = LinearLayout(ctx)
-            if (listMode) {
-                container.orientation = LinearLayout.HORIZONTAL
-                container.gravity = Gravity.CENTER_VERTICAL
-                container.setPadding(dpi(6), dpi(8), dpi(6), dpi(8))
-                label.textSize = 16f
-                container.addView(icon, LinearLayout.LayoutParams(dpi(44), dpi(44)))
-                container.addView(label, LinearLayout.LayoutParams(0, WRAP, 1f).apply {
-                    leftMargin = dpi(14)
-                })
-                container.layoutParams = RecyclerView.LayoutParams(MATCH, WRAP)
-            } else {
-                container.orientation = LinearLayout.VERTICAL
-                container.gravity = Gravity.CENTER_HORIZONTAL
-                container.setPadding(dpi(4), dpi(10), dpi(4), dpi(10))
-                label.textSize = 12f
-                label.gravity = Gravity.CENTER
-                label.setShadowLayer(6f, 0f, 1f, 0x99000000.toInt())
-                container.addView(icon, LinearLayout.LayoutParams(dpi(58), dpi(58)))
-                container.addView(label, LinearLayout.LayoutParams(MATCH, WRAP).apply {
-                    topMargin = dpi(6)
-                })
-                container.layoutParams = RecyclerView.LayoutParams(MATCH, WRAP)
+            val row = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dpi(6), dpi(8), dpi(6), dpi(8))
+                layoutParams = RecyclerView.LayoutParams(MATCH, WRAP)
             }
-            return VH(container, icon, label)
+            row.addView(icon, LinearLayout.LayoutParams(dpi(44), dpi(44)))
+            row.addView(label, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dpi(14) })
+            return VH(row, icon, label)
         }
 
         override fun onBindViewHolder(holder: VH, position: Int) {
             val app = items[position]
-            holder.icon.setImageDrawable(app.icon)
+            holder.icon.setImageDrawable(app.freshIcon())
             holder.label.text = app.label
-            holder.label.visibility =
-                if (listMode || showLabels) View.VISIBLE else View.GONE
-            holder.itemView.setOnClickListener { v ->
-                v.animate().scaleX(0.9f).scaleY(0.9f).setDuration(80).withEndAction {
-                    v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
-                }.start()
-                onClick(app)
-            }
-            holder.itemView.setOnLongClickListener { v -> onLongClick(app, v); true }
+            holder.itemView.setOnClickListener { launch(app) }
+            holder.itemView.setOnLongClickListener { v -> showAppMenu(app, v); true }
         }
 
         override fun getItemCount(): Int = items.size

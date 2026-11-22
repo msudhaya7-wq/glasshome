@@ -30,7 +30,7 @@ object AppRepository {
                 AppEntry(
                     label = it.loadLabel(pm).toString(),
                     component = ComponentName(it.activityInfo.packageName, it.activityInfo.name),
-                    icon = it.loadIcon(pm)
+                    icon = IconShaper.shape(context, it.loadIcon(pm))
                 )
             }
             .distinctBy { it.key }
@@ -65,3 +65,7 @@ object AppRepository {
         return result.take(4)
     }
 }
+
+/** Ore icon-a pala idangalla (grid, dock, search) kaatta, ovvoru view-kum thani copy. */
+fun AppEntry.freshIcon(): Drawable =
+    icon.constantState?.newDrawable()?.mutate() ?: icon
